@@ -186,7 +186,8 @@ class Jackett:
             return []
         
         q, item_year, season_year, season, ep = self._get_series_search_params(item)
-
+        episode_year = None
+        
         if not q:
             logger.debug(f"No search query found for {item.log_string}")
             return []
@@ -201,13 +202,14 @@ class Jackett:
         if ep and indexer.tv_search_capabilities and "ep" in indexer.tv_search_capabilities: params["ep"] = ep 
         if season and indexer.tv_search_capabilities and "season" in indexer.tv_search_capabilities: params["season"] = season
         
-        
+        if hasattr(item, "year") and item.year:
+            episode_year = item.year
         
         if indexer.tv_search_capabilities and "imdbid" in indexer.tv_search_capabilities:
             params["imdbid"] = item.imdb_id if isinstance(item, [Episode, Show]) else item.parent.imdb_id
 
         url = f"{self.settings.url}/api/v2.0/indexers/{indexer.id}/results/torznab/api"
-        return self._fetch_results(url, params, indexer.title, "series", item_year, season_year)
+        return self._fetch_results(url, params, indexer.title, "series", item_year, season_year, episode_year)
 
     def _get_series_search_params(self, item: MediaItem) -> Tuple[str, int, Optional[int]]:
         """Get search parameters for series"""
@@ -255,7 +257,8 @@ class Jackett:
             indexer_list.append(indexer)
         return indexer_list
 
-    def _fetch_results(self, url: str, params: Dict[str, str], indexer_title: str, search_type: str, item_year: int = None, season_year: int = None ) -> List[Tuple[str, str]]:
+    def _fetch_results(self, url: str, params: Dict[str, str], indexer_title: str,
+                       search_type: str, item_year: int = None, season_year: int = None, episode_year: int = None ) -> List[Tuple[str, str]]:
         """Fetch results from the given indexer"""
         try:
             if self.second_limiter:
@@ -264,7 +267,9 @@ class Jackett:
             else:
                 response = requests.get(url, params=params, timeout=self.timeout)
             response.raise_for_status()
-            return self._parse_xml(response.text, item_year, season_year)
+            
+            
+            return self._parse_xml(response.text, item_year, season_year, episode_year)
         except (HTTPError, ConnectionError, Timeout):
             logger.debug(f"Indexer failed to fetch results for {search_type}: {indexer_title}")
         except Exception as e:
@@ -274,7 +279,7 @@ class Jackett:
                 logger.error(f"Exception while fetching results from {indexer_title} ({search_type}): {e}")
         return []
 
-    def _parse_xml(self, xml_content: str, item_year: int = None, season_year: int = None) -> list[tuple[str, str]]:
+    def _parse_xml(self, xml_content: str, item_year: int = None, season_year: int = None, episode_year: int = None) -> list[tuple[str, str]]:
         """
         Parse the torrents from the XML content, 
         ensuring the year in the publication date is equal to or after the specified item year,
@@ -305,12 +310,13 @@ class Jackett:
                 title_years = year_pattern.findall(title)
                 title_year_valid = any(
                     (item_year is not None and int(year) == item_year) or
-                    (season_year is not None and int(year) == season_year)
+                    (season_year is not None and int(year) == season_year) or
+                    (episode_year is not None and int(year) == episode_year)
                     for year in title_years
                 )
                 if not (title_year_valid or (pubDate_year >= item_year and not any(year for year in title_years if year != str(item_year)))):
                     logger.debug(f"Removing invalid torrent name: {title}, Publish Date: {pubDate} Publish Year: {pubDate_year} Title years matched {title_years}")
-                    continue  # Skip the entry if conditions based on item_year or season_year are not met
+                    continue  # Skip the entry if conditions based show_year, season_year or episode_year are not met
 
             result_list.append((title, infoHash.attrib["value"]))
 
