@@ -84,41 +84,43 @@ class TraktIndexer:
         for season in seasons:
             if season.number == 0:
                 continue
-            season_item = _map_item_from_data(season, "season", show.genres)
+            season_item = _map_item_from_data(season, "season")
             if season_item:
                 for episode in season.episodes:
-                    episode_item = _map_item_from_data(episode, "episode", show.genres)
+                    episode_item = _map_item_from_data(episode, "episode")
                     if episode_item:
                         season_item.add_episode(episode_item)
                 show.add_season(season_item)
 
+        # Propagate important global attributes to seasons and episodes
+        show.propagate_attributes_to_childs()
 
-def _map_item_from_data(data, item_type: str, show_genres: List[str] = None) -> Optional[MediaItem]:
+def _map_item_from_data(data, item_type: str) -> Optional[MediaItem]:
     """Map trakt.tv API data to MediaItemContainer."""
     if item_type not in ["movie", "show", "season", "episode"]:
         logger.debug(f"Unknown item type {item_type} for {data.title} not found in list of acceptable items")
         return None
 
     formatted_aired_at = _get_formatted_date(data, item_type)
-    genres = getattr(data, "genres", None) or show_genres
+    year = getattr(data, "year", None) or (formatted_aired_at.year if formatted_aired_at else None)
 
     item = {
         "title": getattr(data, "title", None),
-        "year": getattr(data, "year", None),
+        "year": year,
         "status": getattr(data, "status", None),
         "aired_at": formatted_aired_at,
         "imdb_id": getattr(data.ids, "imdb", None),
         "tvdb_id": getattr(data.ids, "tvdb", None),
         "tmdb_id": getattr(data.ids, "tmdb", None),
-        "genres": genres,
+        "genres": getattr(data, "genres", None),
         "network": getattr(data, "network", None),
         "country": getattr(data, "country", None),
         "language": getattr(data, "language", None),
-        "requested_at": datetime.now(),
+        "requested_at": datetime.now(),    
     }
-
+        
     item["is_anime"] = (
-        ("anime" in genres or "animation" in genres) if genres
+        ("anime" in item['genres'] or "animation" in item['genres']) if item['genres']
         and item["country"] in ("jp", "kr")
         else False
     )
