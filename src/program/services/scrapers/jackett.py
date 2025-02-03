@@ -45,6 +45,12 @@ class Jackett:
         self.settings = settings_manager.settings.scraping.jackett
         self.request_handler = None
         self.initialized = self.validate()
+        # Initialize the timeout tracking dictionary once indexers are available
+        if self.indexers:
+            self.indexer_timeout_data: Dict[str, Dict[str, Optional[float]]] = {}
+            for indexer in self.indexers:
+                # Each indexer has a counter and a 'disabled_until' timestamp (None if not disabled)
+                self.indexer_timeout_data[indexer.id] = {"count": 0, "disabled_until": None}
         if not self.initialized and not self.api_key:
             return
         logger.success("Jackett initialized!")
@@ -67,6 +73,10 @@ class Jackett:
                     logger.error("No Jackett indexers configured.")
                     return False
                 self.indexers = indexers
+                # Initialize timeout tracking data for each indexer
+                self.indexer_timeout_data = {}
+                for indexer in self.indexers:
+                    self.indexer_timeout_data[indexer.id] = {"count": 0, "disabled_until": None}
                 rate_limit_params = get_rate_limit_params(max_calls=len(self.indexers),
                                                           period=2) if self.settings.ratelimit else None
                 http_adapter = get_http_adapter(pool_connections=len(self.indexers), pool_maxsize=len(self.indexers))
@@ -160,12 +170,14 @@ class Jackett:
             "q": item.title,
         }
         if indexer.movie_search_capabilities and "year" in indexer.movie_search_capabilities:
-            if hasattr(item.aired_at, "year") and item.aired_at.year: params["year"] = item.aired_at.year
+            if hasattr(item.aired_at, "year") and item.aired_at.year:
+                params["year"] = item.aired_at.year
         if indexer.movie_search_capabilities and "imdbid" in indexer.movie_search_capabilities:
             params["imdbid"] = item.imdb_id
 
         url = f"{self.settings.url}/api/v2.0/indexers/{indexer.id}/results/torznab/api"
-        return self._fetch_results(url, params, indexer.title, "movie")
+        # Pass the full indexer object to _fetch_results
+        return self._fetch_results(url, params, indexer, "movie")
 
     def _search_series_indexer(self, item: MediaItem, indexer: JackettIndexer) -> List[Tuple[str, str]]:
         """Search for series on the given indexer"""
@@ -183,13 +195,16 @@ class Jackett:
             "cat": "5000",
             "q": q
         }
-        if ep and indexer.tv_search_capabilities and "ep" in indexer.tv_search_capabilities: params["ep"] = ep 
-        if season and indexer.tv_search_capabilities and "season" in indexer.tv_search_capabilities: params["season"] = season
+        if ep and indexer.tv_search_capabilities and "ep" in indexer.tv_search_capabilities:
+            params["ep"] = ep 
+        if season and indexer.tv_search_capabilities and "season" in indexer.tv_search_capabilities:
+            params["season"] = season
         if indexer.tv_search_capabilities and "imdbid" in indexer.tv_search_capabilities:
             params["imdbid"] = item.imdb_id if isinstance(item, (Episode, Show)) else item.parent.imdb_id
 
         url = f"{self.settings.url}/api/v2.0/indexers/{indexer.id}/results/torznab/api"
-        return self._fetch_results(url, params, indexer.title, "series")
+        # Pass the full indexer object to _fetch_results
+        return self._fetch_results(url, params, indexer, "series")
 
     def _get_series_search_params(self, item: MediaItem) -> Tuple[str, int, Optional[int]]:
         """Get search parameters for series"""
@@ -213,7 +228,7 @@ class Jackett:
             logger.error(f"Exception while getting indexers from Jackett: {e}")
             return []
 
-    def _get_indexer_from_xml(self, xml_content: str) -> list[JackettIndexer]:
+    def _get_indexer_from_xml(self, xml_content: str) -> List[JackettIndexer]:
         """Parse the indexers from the XML content"""
         xml_root = ET.fromstring(xml_content)
 
@@ -238,24 +253,52 @@ class Jackett:
             indexer_list.append(indexer)
         return indexer_list
 
-    def _fetch_results(self, url: str, params: Dict[str, str], indexer_title: str, search_type: str) -> List[Tuple[str, str]]:
-        """Fetch results from the given indexer"""
+    def _fetch_results(self, url: str, params: Dict[str, str], indexer: JackettIndexer, search_type: str) -> List[Tuple[str, str]]:
+        """Fetch results from the given indexer with timeout tracking and indexer disabling."""
+        # First, check if the indexer is currently disabled
+        timeout_data = self.indexer_timeout_data.get(indexer.id)
+        if timeout_data and timeout_data["disabled_until"] is not None:
+            if time.time() < timeout_data["disabled_until"]:
+                logger.info(f"Skipping disabled indexer {indexer.title} until {time.ctime(timeout_data['disabled_until'])}")
+                return []
+            else:
+                # The disabled period has passed; reset the counter and re-enable the indexer.
+                self.indexer_timeout_data[indexer.id]["count"] = 0
+                self.indexer_timeout_data[indexer.id]["disabled_until"] = None
+
         try:
             response = self.request_handler.execute(HttpMethod.GET, url, params=params, timeout=self.settings.timeout)
             return self._parse_xml(response.response.text)
         except RateLimitExceeded:
-            logger.warning(f"Rate limit exceeded while fetching results for {search_type}: {indexer_title}")
+            logger.warning(f"Rate limit exceeded while fetching results for {search_type}: {indexer.title}")
             return []
-        except (HTTPError, ConnectionError, Timeout):
-            logger.debug(f"Indexer failed to fetch results for {search_type}: {indexer_title}")
+        except (Timeout, ReadTimeout) as e:
+            # Update timeout count and possibly disable the indexer.
+            self._update_timeout_count(indexer)
+            logger.debug(f"Timeout occurred while fetching results for {search_type}: {indexer.title}")
+            return []
+        except (HTTPError, ConnectionError) as e:
+            logger.debug(f"Indexer failed to fetch results for {search_type}: {indexer.title}")
         except Exception as e:
             if "Jackett.Common.IndexerException" in str(e):
-                logger.error(f"Indexer exception while fetching results from {indexer_title} ({search_type}): {e}")
+                logger.error(f"Indexer exception while fetching results from {indexer.title} ({search_type}): {e}")
             else:
-                logger.error(f"Exception while fetching results from {indexer_title} ({search_type}): {e}")
+                logger.error(f"Exception while fetching results from {indexer.title} ({search_type}): {e}")
         return []
 
-    def _parse_xml(self, xml_content: str) -> list[tuple[str, str]]:
+    def _update_timeout_count(self, indexer: JackettIndexer) -> None:
+        """
+        Increase the timeout counter for the given indexer.
+        If the indexer has timed out two or more times, disable it for 24 hours.
+        """
+        data = self.indexer_timeout_data.get(indexer.id, {"count": 0, "disabled_until": None})
+        data["count"] += 1
+        if data["count"] >= 3:
+            data["disabled_until"] = time.time() + 86400  # Disable for 24 hours
+            logger.warning(f"Indexer {indexer.title} disabled for 24 hours due to multiple timeouts.")
+        self.indexer_timeout_data[indexer.id] = data
+
+    def _parse_xml(self, xml_content: str) -> List[Tuple[str, str]]:
         """Parse the torrents from the XML content"""
         xml_root = ET.fromstring(xml_content)
         result_list = []
@@ -273,7 +316,7 @@ class Jackett:
         """Log the indexers information"""
         for indexer in self.indexers:
             # logger.debug(f"Indexer: {indexer.title} - {indexer.link} - {indexer.type}")
-            if not indexer.movie_search_capabilities:
+            if not indexer.movie_search_capabilities: 
                 logger.debug(f"Movie search not available for {indexer.title}")
             if not indexer.tv_search_capabilities:
                 logger.debug(f"TV search not available for {indexer.title}")
