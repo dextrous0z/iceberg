@@ -1,17 +1,16 @@
 """MediaItem class"""
+from PTT import parse_title
 from datetime import datetime
-from enum import Enum
 from pathlib import Path
 from typing import List, Optional, Self
 
 import sqlalchemy
 from loguru import logger
-from RTN import parse
 from sqlalchemy import Index
 from sqlalchemy.orm import Mapped, mapped_column, object_session, relationship
 
 from program.db.db import db
-from program.managers.sse_manager import sse_manager
+from program.managers.websocket_manager import manager as websocket_manager
 from program.media.state import States
 from program.media.subtitle import Subtitle
 
@@ -60,6 +59,7 @@ class MediaItem(db.Model):
     overseerr_id: Mapped[Optional[int]] = mapped_column(sqlalchemy.Integer, nullable=True)
     last_state: Mapped[Optional[States]] = mapped_column(sqlalchemy.Enum(States), default=States.Unknown)
     subtitles: Mapped[list[Subtitle]] = relationship(Subtitle, back_populates="parent", lazy="selectin", cascade="all, delete-orphan")
+    failed_attempts: Mapped[Optional[int]] = mapped_column(sqlalchemy.Integer, default=0)
 
     __mapper_args__ = {
         "polymorphic_identity": "mediaitem",
@@ -147,7 +147,7 @@ class MediaItem(db.Model):
         previous_state = self.last_state
         new_state = given_state if given_state else self._determine_state()
         if previous_state and previous_state != new_state:
-            sse_manager.publish_event("item_update", {"last_state": previous_state, "new_state": new_state, "item_id": self.id})
+            websocket_manager.publish("item_update", {"last_state": previous_state, "new_state": new_state, "item_id": self.id})
         self.last_state = new_state
         return (previous_state, new_state)
 
@@ -183,6 +183,10 @@ class MediaItem(db.Model):
         return self._determine_state()
 
     def _determine_state(self):
+        if self.last_state == States.Paused:
+            return States.Paused
+        if self.last_state == States.Failed:
+            return States.Failed
         if self.key or self.update_folder == "updated":
             return States.Completed
         elif self.symlinked:
@@ -212,14 +216,15 @@ class MediaItem(db.Model):
         self.is_anime = getattr(other, "is_anime", False)
         self.overseerr_id = getattr(other, "overseerr_id", None)
 
-    def is_scraped(self):
+    def is_scraped(self) -> bool:
+        """Check if the item has been scraped."""
         session = object_session(self)
         if session and session.is_active:
             try:
                 session.refresh(self, attribute_names=["blacklisted_streams"])
                 return (len(self.streams) > 0 and any(stream not in self.blacklisted_streams for stream in self.streams))
-            except (sqlalchemy.exc.InvalidRequestError, sqlalchemy.orm.exc.DetachedInstanceError):
-                return False
+            except Exception as e:
+                logger.exception(f"Error in is_scraped() for {self.log_string}: {str(e)}")
         return False
 
     def to_dict(self):
@@ -381,11 +386,22 @@ class MediaItem(db.Model):
         self.set("symlinked_at", None)
         self.set("update_folder", None)
         self.set("scraped_at", None)
-
         self.set("symlinked_times", 0)
         self.set("scraped_times", 0)
+        self.set("failed_attempts", 0)
 
         logger.debug(f"Item {self.log_string} has been reset")
+
+    def soft_reset(self):
+        """Soft reset item attributes."""
+        self.blacklist_active_stream()
+        self.set("file", None)
+        self.set("folder", None)
+        self.set("alternative_folder", None)
+        self.set("active_stream", {})
+        self.set("symlinked", False)
+        self.set("symlinked_at", None)
+        self.set("symlinked_times", 0)
 
     @property
     def log_string(self):
@@ -394,6 +410,41 @@ class MediaItem(db.Model):
     @property
     def collection(self):
         return self.parent.collection if self.parent else self.id
+
+    def is_parent_blocked(self) -> bool:
+        """
+        Check if any parent is paused.
+
+        A paused item blocks all processing of itself and its children,
+        typically set by user action from the frontend.
+        """
+        if self.last_state == States.Paused:
+            return True
+            
+        session = object_session(self)
+        if session and hasattr(self, "parent"):
+            session.refresh(self, ["parent"])
+            if self.parent:
+                return self.parent.is_parent_blocked()
+        return False
+
+    def get_blocking_parent(self) -> Optional["MediaItem"]:
+        """
+        Get the parent that is paused and blocking this item (if any).
+
+        Returns:
+            MediaItem | None: The parent in a Paused state,
+                            or None if no parent is paused.
+        """
+        if self.last_state == States.Paused:
+            return self
+            
+        session = object_session(self)
+        if session and hasattr(self, "parent"):
+            session.refresh(self, ["parent"])
+            if self.parent:
+                return self.parent.get_blocking_parent()
+        return None
 
 
 class Movie(MediaItem):
@@ -446,6 +497,10 @@ class Show(MediaItem):
         return None
 
     def _determine_state(self):
+        if all(season.state == States.Paused for season in self.seasons):
+            return States.Paused
+        if all(season.state == States.Failed for season in self.seasons):
+            return States.Failed
         if all(season.state == States.Completed for season in self.seasons):
             return States.Completed
         if any(season.state in [States.Ongoing, States.Unreleased] for season in self.seasons):
@@ -463,7 +518,6 @@ class Show(MediaItem):
             return States.Scraped
         if any(season.state == States.Indexed for season in self.seasons):
             return States.Indexed
-
         if all(not season.is_released for season in self.seasons):
             return States.Unreleased
         if any(season.state == States.Requested for season in self.seasons):
@@ -528,6 +582,26 @@ class Show(MediaItem):
             for episode in season.episodes:
                 propagate(episode, self)
 
+    def get_episode(self, episode_number: int, season_number: int = None) -> Optional["Episode"]:
+        """Get the absolute episode number based on season and episode."""
+        if not episode_number or episode_number == 0:
+            return None
+
+        if season_number is not None:
+            season = next((s for s in self.seasons if s.number == season_number), None)
+            if season:
+                episode = next((e for e in season.episodes if e.number == episode_number), None)
+                if episode:
+                    return episode
+
+        episode_count = 0
+        for season in self.seasons:
+            for episode in season.episodes:
+                episode_count += 1
+                if episode_count == episode_number:
+                    return episode
+
+        return None
 
 class Season(MediaItem):
     """Season class"""
@@ -556,6 +630,10 @@ class Season(MediaItem):
 
     def _determine_state(self):
         if len(self.episodes) > 0:
+            if all(episode.state == States.Paused for episode in self.episodes):
+                return States.Paused
+            if all(episode.state == States.Failed for episode in self.episodes):
+                return States.Failed
             if all(episode.state == States.Completed for episode in self.episodes):
                 return States.Completed
             if any(episode.state == States.Unreleased for episode in self.episodes):
@@ -630,6 +708,10 @@ class Season(MediaItem):
         return self.parent.log_string + " S" + str(self.number).zfill(2)
 
     def get_top_title(self) -> str:
+        """Get the top title of the season."""
+        session = object_session(self)
+        if session:
+            session.refresh(self, ["parent"])
         return self.parent.title
 
 
@@ -669,7 +751,7 @@ class Episode(MediaItem):
         if not self.file or not isinstance(self.file, str):
             raise ValueError("The file attribute must be a non-empty string.")
         # return list of episodes
-        return parse(self.file).episodes
+        return parse_title(self.file)["episodes"]
 
     @property
     def log_string(self):

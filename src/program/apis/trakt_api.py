@@ -1,9 +1,9 @@
-﻿import re
+﻿import os
+import re
 from datetime import datetime
 from types import SimpleNamespace
 from typing import List, Optional, Union
 from urllib.parse import urlencode
-
 from requests import RequestException, Session
 
 from program import MediaItem
@@ -50,7 +50,8 @@ class TraktAPI:
         self.oauth_redirect_uri = self.settings.oauth.oauth_redirect_uri
         rate_limit_params = get_rate_limit_params(max_calls=1000, period=300)
         trakt_cache = get_cache_params("trakt", 86400)
-        session = create_service_session(rate_limit_params=rate_limit_params, use_cache=True, cache_params=trakt_cache)
+        use_cache = os.environ.get("SKIP_TRAKT_CACHE", "false").lower() == "true"
+        session = create_service_session(rate_limit_params=rate_limit_params, use_cache=use_cache, cache_params=trakt_cache)
         self.headers = {
             "Content-type": "application/json",
             "trakt-api-key": self.CLIENT_ID,
@@ -71,13 +72,14 @@ class TraktAPI:
             try:
                 response = self.request_handler.execute(HttpMethod.GET, url, params={**params, "page": page})
                 if response.is_ok:
-                    data = response.data
+                    data = response.data if isinstance(response.data, list) else [response.data]
                     if not data:
                         break
                     all_data.extend(data)
                     if "X-Pagination-Page-Count" not in response.response.headers:
                         break
                     if params.get("limit") and len(all_data) >= params["limit"]:
+                        all_data = all_data[:params["limit"]]
                         break
                     page += 1
                 elif response.status_code == 429:

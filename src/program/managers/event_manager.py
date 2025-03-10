@@ -1,8 +1,7 @@
 import os
-import sys
 import threading
-import time
 import traceback
+import sqlalchemy.orm
 from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import datetime
 from queue import Empty
@@ -14,8 +13,9 @@ from pydantic import BaseModel
 
 from program.db import db_functions
 from program.db.db import db
-from program.managers.sse_manager import sse_manager
+from program.managers.websocket_manager import manager as websocket_manager
 from program.types import Event
+from program.media.item import MediaItem
 
 
 class EventUpdate(BaseModel):
@@ -69,14 +69,17 @@ class EventManager:
         """
 
         if future.cancelled():
-            logger.debug(f"Future for {future} was cancelled.")
+            if hasattr(future, "event") and future.event:
+                logger.debug(f"Future for {future.event.log_message} was cancelled.")
+            else:
+                logger.debug(f"Future for {future} was cancelled.")
             return  # Skip processing if the future was cancelled
 
         try:
             result = future.result()
             if future in self._futures:
                 self._futures.remove(future)
-            sse_manager.publish_event("event_update", self.get_event_updates())
+            websocket_manager.publish("event_update", self.get_event_updates())
             if isinstance(result, tuple):
                 item_id, timestamp = result
             else:
@@ -104,6 +107,25 @@ class EventManager:
             event (Event): The event to add to the queue.
         """
         with self.mutex:
+            if event.item_id:
+                with db.Session() as session:
+                    try:
+                        # Query just the columns we need, avoiding relationship loading entirely
+                        item = session.query(MediaItem).filter_by(id=event.item_id).options(
+                            sqlalchemy.orm.load_only(MediaItem.id, MediaItem.last_state)
+                        ).one_or_none()
+                    except Exception as e:
+                        logger.error(f"Error getting item from database: {e}")
+                        return
+
+                    if not item and not event.content_item:
+                        logger.error(f"No item found from event: {event.log_message}")
+                        return
+
+                    if item.is_parent_blocked():
+                        logger.debug(f"Not queuing {item.log_string if item.log_string else event.log_message}: Item is {item.last_state.name}")
+                        return
+
             self._queued_events.append(event)
             if log_message:
                 logger.debug(f"Added {event.log_message} to the queue.")
@@ -184,97 +206,8 @@ class EventManager:
         if event:
             future.event = event
         self._futures.append(future)
-        sse_manager.publish_event("event_update", self.get_event_updates())
+        websocket_manager.publish("event_update", self.get_event_updates())
         future.add_done_callback(lambda f:self._process_future(f, service))
-
-    # For debugging purposes we can monitor the execution time of the service. (comment out above and uncomment below)
-    # def submit_job(self, service, program, event=None):
-    #     """
-    #     Submits a job to be executed by the service.
-
-    #     Args:
-    #         service (type): The service class to execute.
-    #         program (Program): The program containing the service.
-    #         item (Event, optional): The event item to process. Defaults to None.
-    #     """
-    #     log_message = f"Submitting service {service.__name__} to be executed"
-    #     if event:
-    #         log_message += f" with {event.log_message}"
-    #     logger.debug(log_message)
-
-    #     cancellation_event = threading.Event()
-    #     executor = self._find_or_create_executor(service)
-        
-    #     # Add start time to track execution duration
-    #     start_time = datetime.now()
-        
-    #     def _monitor_execution(future):
-    #         """Monitor execution time and log if taking too long"""
-    #         while not future.done():
-    #             execution_time = (datetime.now() - start_time).total_seconds()
-    #             if execution_time > 180:  # 3 minutes
-    #                 current_thread = None
-    #                 for thread in threading.enumerate():
-    #                     if thread.name.startswith(service.__name__) and not thread.name.endswith('_monitor'):
-    #                         current_thread = thread
-    #                         break
-                            
-    #                 if current_thread:
-    #                     # Get stack frames for the worker thread
-    #                     frames = sys._current_frames()
-    #                     thread_frame = None
-    #                     for thread_id, frame in frames.items():
-    #                         if thread_id == current_thread.ident:
-    #                             thread_frame = frame
-    #                             break
-                        
-    #                     if thread_frame:
-    #                         stack_trace = ''.join(traceback.format_stack(thread_frame))
-    #                     else:
-    #                         stack_trace = "Could not get stack trace for worker thread"
-    #                 else:
-    #                     stack_trace = "Could not find worker thread"
-                    
-    #                 logger.warning(
-    #                     f"Service {service.__name__} execution taking longer than 3 minutes!\n"
-    #                     f"Event: {event.log_message if event else 'No event'}\n"
-    #                     f"Execution time: {execution_time:.1f} seconds\n"
-    #                     f"Thread name: {current_thread.name if current_thread else 'Unknown'}\n"
-    #                     f"Thread alive: {current_thread.is_alive() if current_thread else 'Unknown'}\n"
-    #                     f"Stack trace:\n{stack_trace}"
-    #                 )
-                    
-    #                 # Cancel the future and kill the thread
-    #                 future.cancellation_event.set()
-    #                 future.cancel()
-    #                 if current_thread:
-    #                     logger.warning(f"Killing thread {current_thread.name} due to timeout")
-    #                     self._futures.remove(future)
-    #                     if event:
-    #                         self.remove_event_from_running(event)
-    #                 return  # Exit the monitoring thread
-                    
-    #             time.sleep(60)  # Check every minute
-
-    #     future = executor.submit(db_functions.run_thread_with_db_item, 
-    #                         program.all_services[service].run, 
-    #                         service, program, event, cancellation_event)
-        
-    #     # Start monitoring thread
-    #     monitor_thread = threading.Thread(
-    #         target=_monitor_execution, 
-    #         args=(future,),
-    #         name=f"{service.__name__}_monitor",
-    #         daemon=True
-    #     )
-    #     monitor_thread.start()
-        
-    #     future.cancellation_event = cancellation_event
-    #     if event:
-    #         future.event = event
-    #     self._futures.append(future)
-    #     sse_manager.publish_event("event_update", self.get_event_updates())
-    #     future.add_done_callback(lambda f: self._process_future(f, service))
 
     def cancel_job(self, item_id: str, suppress_logs=False):
         """
@@ -310,7 +243,7 @@ class EventManager:
 
         logger.debug(f"Canceled jobs for Item ID {item_id} and its children.")
 
-    def next(self):
+    def next(self) -> Event:
         """
         Get the next event in the queue with an optional timeout.
 
@@ -324,12 +257,12 @@ class EventManager:
             if self._queued_events:
                 with self.mutex:
                     self._queued_events.sort(key=lambda event: event.run_at)
-                    if datetime.now() >= self._queued_events[0].run_at:
+                    if self._queued_events and datetime.now() >= self._queued_events[0].run_at:
                         event = self._queued_events.pop(0)
                         return event
             raise Empty
 
-    def _id_in_queue(self, _id):
+    def _id_in_queue(self, _id: str) -> bool:
         """
         Checks if an item with the given ID is in the queue.
 
@@ -341,7 +274,7 @@ class EventManager:
         """
         return any(event.item_id == _id for event in self._queued_events)
 
-    def _id_in_running_events(self, _id):
+    def _id_in_running_events(self, _id: str) -> bool:
         """
         Checks if an item with the given ID is in the running events.
 
@@ -353,7 +286,7 @@ class EventManager:
         """
         return any(event.item_id == _id for event in self._running_events)
 
-    def add_event(self, event: Event):
+    def add_event(self, event: Event) -> bool:
         """
         Adds an event to the queue if it is not already present in the queue or running events.
 
@@ -382,16 +315,14 @@ class EventManager:
             if any(event.content_item and event.content_item.imdb_id == imdb_id for event in self._queued_events):
                 logger.debug(f"Content Item with IMDB ID {imdb_id} is already in queue, skipping.")
                 return False
-            if any(
-                event.content_item and event.content_item.imdb_id == imdb_id for event in self._running_events
-            ):
+            if any(event.content_item and event.content_item.imdb_id == imdb_id for event in self._running_events):
                 logger.debug(f"Content Item with IMDB ID {imdb_id} is already running, skipping.")
                 return False
 
         self.add_event_to_queue(event)
         return True
 
-    def add_item(self, item, service="Manual"):
+    def add_item(self, item, service: str = "Manual") -> bool:
         """
         Adds an item to the queue as an event.
 
@@ -405,6 +336,12 @@ class EventManager:
 
 
     def get_event_updates(self) -> Dict[str, List[str]]:
+        """
+        Get the event updates for the SSE manager.
+
+        Returns:
+            Dict[str, List[str]]: A dictionary with the event types as keys and a list of item IDs as values.
+        """
         events = [future.event for future in self._futures if hasattr(future, "event")]
         event_types = ["Scraping", "Downloader", "Symlinker", "Updater", "PostProcessing"]
 

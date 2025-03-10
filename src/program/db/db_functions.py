@@ -1,13 +1,13 @@
 import os
 import shutil
-from threading import Event
-from typing import TYPE_CHECKING
+import alembic
 
 from loguru import logger
-from sqlalchemy import delete, exists, insert, inspect, or_, select, text
-from sqlalchemy.orm import Session, joinedload, selectinload
+from threading import Event
+from typing import TYPE_CHECKING, Optional
+from sqlalchemy import delete, insert, inspect, or_, select, text
+from sqlalchemy.orm import Session, selectinload
 
-import alembic
 from program.media.stream import Stream, StreamBlacklistRelation, StreamRelation
 from program.services.libraries.symlink import fix_broken_symlinks
 from program.settings.manager import settings_manager
@@ -18,7 +18,9 @@ from .db import db
 if TYPE_CHECKING:
     from program.media.item import MediaItem
 
-def get_item_by_id(item_id: str, item_types = None, session = None):
+
+def get_item_by_id(item_id: str, item_types: list[str] = None, session: Session = None) -> "MediaItem":
+    """Get a MediaItem by its ID."""
     if not item_id:
         return None
 
@@ -40,23 +42,25 @@ def get_item_by_id(item_id: str, item_types = None, session = None):
             _session.expunge(item)
         return item
 
-def get_items_by_ids(ids: list, item_types = None, session = None):
+def get_items_by_ids(ids: list, item_types: list[str] = None, session: Session = None) -> list["MediaItem"]:
+    """Get a list of MediaItems by their IDs."""
     items = []
     for id in ids:
         items.append(get_item_by_id(id, item_types,  session))
     return items
 
-def get_item_by_external_id(imdb_id: str = None, tvdb_id: int = None, tmdb_id: int = None, session = None):
+def get_item_by_external_id(imdb_id: str = None, tvdb_id: int = None, tmdb_id: int = None, session: Session = None) -> "MediaItem":
+    """Get a MediaItem by its external ID."""
     from program.media.item import MediaItem, Season, Show
 
     _session = session if session else db.Session()
     query = (
         select(MediaItem)
         .options(
-            joinedload(Show.seasons)
-            .joinedload(Season.episodes),
-            joinedload(Season.episodes)
+            selectinload(Show.seasons)
+            .selectinload(Season.episodes)
         )
+        .where(or_(MediaItem.type == "movie", MediaItem.type == "show"))
     )
 
     if imdb_id:
@@ -81,10 +85,9 @@ def delete_media_item(item: "MediaItem"):
         session.delete(item)
         session.commit()
 
-def delete_media_item_by_id(media_item_id: str, batch_size: int = 30):
+def delete_media_item_by_id(media_item_id: str, batch_size: int = 30) -> bool:
     """Delete a Movie or Show by _id. If it's a Show, delete its Seasons and Episodes in batches, committing after each batch."""
     from sqlalchemy.exc import IntegrityError
-
     from program.media.item import Episode, MediaItem, Movie, Season, Show
 
     if not media_item_id:
@@ -134,23 +137,19 @@ def delete_media_item_by_id(media_item_id: str, batch_size: int = 30):
             session.rollback()
             return False
 
-def delete_seasons_and_episodes(session, season_ids: list[str], batch_size: int = 30):
+def delete_seasons_and_episodes(session: Session, season_ids: list[str], batch_size: int = 30):
     """Delete seasons and episodes of a show in batches, committing after each batch."""
     from program.media.item import Episode, Season
     from program.media.stream import StreamBlacklistRelation, StreamRelation
     from program.media.subtitle import Subtitle
 
     for season_id in season_ids:
-        # Load the season object
         season = session.query(Season).get(season_id)
-
-        # Bulk delete related streams and subtitles
         session.execute(delete(StreamRelation).where(StreamRelation.parent_id == season_id))
         session.execute(delete(StreamBlacklistRelation).where(StreamBlacklistRelation.media_item_id == season_id))
         session.execute(delete(Subtitle).where(Subtitle.parent_id == season_id))
-        session.commit()  # Commit after bulk deletion
+        session.commit()
 
-        # Delete episodes in batches for each season
         while True:
             episode_ids = session.execute(
                 select(Episode.id).where(Episode.parent_id == season_id).limit(batch_size)
@@ -160,10 +159,10 @@ def delete_seasons_and_episodes(session, season_ids: list[str], batch_size: int 
                 break
 
             session.execute(delete(Episode).where(Episode.id.in_(episode_ids)))
-            session.commit()  # Commit after each batch of episodes
+            session.commit()
 
-        session.delete(season)  # Delete the season itself
-        session.commit()  # Commit after deleting the season
+        session.delete(season)
+        session.commit()
 
 def reset_media_item(item: "MediaItem"):
     """Reset a MediaItem."""
@@ -175,14 +174,8 @@ def reset_media_item(item: "MediaItem"):
 def reset_streams(item: "MediaItem"):
     """Reset streams associated with a MediaItem."""
     with db.Session() as session:
-
-        session.execute(
-            delete(StreamRelation).where(StreamRelation.parent_id == item.id)
-        )
-
-        session.execute(
-            delete(StreamBlacklistRelation).where(StreamBlacklistRelation.media_item_id == item.id)
-        )
+        session.execute(delete(StreamRelation).where(StreamRelation.parent_id == item.id))
+        session.execute(delete(StreamBlacklistRelation).where(StreamBlacklistRelation.media_item_id == item.id))
         session.commit()
 
 def clear_streams(item: "MediaItem"):
@@ -236,6 +229,7 @@ def blacklist_stream(item: "MediaItem", stream: Stream, session: Session = None)
             session.close()
 
 def unblacklist_stream(item: "MediaItem", stream: Stream, session: Session = None) -> bool:
+    """Unblacklist a stream for a media item."""
     close_session = False
     if session is None:
         session = db.Session()
@@ -269,7 +263,7 @@ def unblacklist_stream(item: "MediaItem", stream: Stream, session: Session = Non
         if close_session:
             session.close()
 
-def get_item_ids(session, item_id: str) -> tuple[str, list[str]]:
+def get_item_ids(session: Session, item_id: str) -> tuple[str, list[str]]:
     """Get the item ID and all related item IDs for a given MediaItem."""
     from program.media.item import Episode, MediaItem, Season
 
@@ -296,7 +290,8 @@ def get_item_ids(session, item_id: str) -> tuple[str, list[str]]:
 
     return item_id, related_ids
 
-def run_thread_with_db_item(fn, service, program, event: Event, cancellation_event: Event):
+def run_thread_with_db_item(fn, service, program, event: Event, cancellation_event: Event) -> Optional[str]:
+    """Run a thread with a MediaItem."""
     from program.media.item import MediaItem
     if event:
         with db.Session() as session:
@@ -330,7 +325,7 @@ def run_thread_with_db_item(fn, service, program, event: Event, cancellation_eve
             if event.content_item:
                 indexed_item = next(fn(event.content_item), None)
                 if indexed_item is None:
-                    logger.debug(f"Unable to index {event.content_item.log_string}")
+                    logger.debug(f"Unable to index {event.content_item.log_string if event.content_item.log_string is not None else event.content_item.imdb_id}")
                     return None
                 indexed_item.store_state()
                 session.add(indexed_item)
@@ -349,7 +344,7 @@ def run_thread_with_db_item(fn, service, program, event: Event, cancellation_eve
                         program.em.add_item(item, service)
     return None
 
-def hard_reset_database():
+def hard_reset_database() -> None:
     """Resets the database to a fresh state while maintaining migration capability."""
     logger.log("DATABASE", "Starting Hard Reset of Database")
 
@@ -436,7 +431,7 @@ def hard_reset_database():
         logger.error(f"Error verifying database state: {str(e)}")
         raise
 
-def hard_reset_database_pre_migration():
+def hard_reset_database_pre_migration() -> None:
     """Resets the database to a fresh state."""
     logger.log("DATABASE", "Starting Hard Reset of Database")
 

@@ -221,17 +221,28 @@ async def add_items(request: Request, imdb_ids: str = None) -> MessageResponse:
 )
 async def get_item(_: Request, id: str, use_tmdb_id: Optional[bool] = False) -> dict:
     with db.Session() as session:
+        query = select(MediaItem)
+        if use_tmdb_id:
+            query = query.where(MediaItem.tmdb_id == id).where(MediaItem.type.in_(["movie", "show"]))
+        else:
+            query = query.where(MediaItem.id == id)
         try:
-            query = select(MediaItem)
-            if use_tmdb_id:
-                query = query.where(MediaItem.tmdb_id == id)
-            else:
-                query = query.where(MediaItem.id == id)
-            item = session.execute(query).unique().scalar_one()
+            item = session.execute(query).unique().scalar_one_or_none()
+            if item:
+                return item.to_extended_dict(with_streams=False)
+            raise NoResultFound
         except NoResultFound:
             raise HTTPException(status_code=404, detail="Item not found")
-        return item.to_extended_dict(with_streams=False)
-
+        except Exception as e:
+            if "Multiple rows were found when one or none was required" in str(e):
+                duplicate_ids = set()
+                items = session.execute(query).unique().scalars().all()
+                for item in items:
+                    duplicate_ids.add(item.id)
+                logger.debug(f"Multiple items found with ID {id}: {duplicate_ids}")
+            else:
+                logger.error(f"Error fetching item with ID {id}: {str(e)}")
+            raise HTTPException(status_code=500, detail=str(e)) from e
 
 @router.get(
     "/{imdb_ids}",
@@ -271,8 +282,14 @@ async def reset_items(request: Request, ids: str) -> ResetResponse:
         for media_item in db_functions.get_items_by_ids(ids):
             try:
                 request.app.program.em.cancel_job(media_item.id)
+                active_hash = media_item.active_stream.get("infohash", None)
+                active_stream = next((stream for stream in media_item.streams if stream.infohash == active_hash), None)
                 db_functions.clear_streams(media_item)
                 db_functions.reset_media_item(media_item)
+                if active_stream:
+                    # lets blacklist the active stream so it doesnt get used again
+                    db_functions.blacklist_stream(media_item, active_stream)
+                    logger.debug(f"Blacklisted stream {active_hash} for item {media_item.log_string}")
             except ValueError as e:
                 logger.error(f"Failed to reset item with id {media_item.id}: {str(e)}")
                 continue
@@ -329,9 +346,11 @@ async def remove_item(request: Request, ids: str) -> RemoveResponse:
     ids: list[str] = handle_ids(ids)
     try:
         media_items: list[MediaItem] = db_functions.get_items_by_ids(ids, ["movie", "show"])
-        if not media_items:
+        if not media_items or not all(isinstance(item, MediaItem) for item in media_items):
             return HTTPException(status_code=404, detail="Item(s) not found")
         for item in media_items:
+            if not item or not isinstance(item, MediaItem):
+                continue
             logger.debug(f"Removing item with ID {item.id}")
             request.app.program.em.cancel_job(item.id)
             await asyncio.sleep(0.2)  # Ensure cancellation is processed
@@ -411,7 +430,7 @@ async def blacklist_stream(_: Request, item_id: str, stream_id: int, db: Session
     }
 
 @router.post(
-    "{item_id}/streams/{stream_id}/unblacklist"
+    "/{item_id}/streams/{stream_id}/unblacklist"
 )
 async def unblacklist_stream(_: Request, item_id: str, stream_id: int, db: Session = Depends(get_db)):
     item: MediaItem = (
@@ -433,3 +452,95 @@ async def unblacklist_stream(_: Request, item_id: str, stream_id: int, db: Sessi
     return {
         "message": f"Unblacklisted stream {stream_id} for item {item_id}",
     }
+
+@router.post(
+    "/{item_id}/streams/reset",
+    summary="Reset Media Item Streams",
+    description="Reset all streams for a media item",
+    operation_id="reset_item_streams",
+)
+async def reset_item_streams(_: Request, item_id: str, db: Session = Depends(get_db)):
+    item: MediaItem = (
+        db.execute(
+            select(MediaItem)
+            .where(MediaItem.id == item_id)
+        )
+        .unique()
+        .scalar_one_or_none()
+    )
+
+    if not item:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Item not found")
+
+    db_functions.clear_streams(item)
+
+    return {
+        "message": f"Successfully reset streams for item {item_id}",
+    }
+
+class PauseResponse(BaseModel):
+    message: str
+    ids: list[str]
+
+@router.post(
+    "/pause",
+    summary="Pause Media Items",
+    description="Pause media items based on item IDs",
+    operation_id="pause_items",
+)
+async def pause_items(request: Request, ids: str) -> PauseResponse:
+    """Pause items and their children from being processed"""
+    ids = handle_ids(ids)
+    try:
+        with db.Session() as session:
+            for media_item in db_functions.get_items_by_ids(ids):
+                try:
+                    item_id, related_ids = db_functions.get_item_ids(session, media_item.id)
+                    all_ids = [item_id] + related_ids
+
+                    for id in all_ids:
+                        request.app.program.em.cancel_job(id)
+                        request.app.program.em.remove_id_from_queues(id)
+
+                    if media_item.last_state not in [States.Paused, States.Failed, States.Completed]:
+                        media_item.store_state(States.Paused)
+                        session.merge(media_item)
+                        session.commit()
+
+                    logger.info(f"Successfully paused items.")
+                except Exception as e:
+                    logger.error(f"Failed to pause {media_item.log_string}: {str(e)}")
+                    continue
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+
+    return {"message": "Successfully paused items.", "ids": ids}
+
+@router.post(
+    "/unpause",
+    summary="Unpause Media Items",
+    description="Unpause media items based on item IDs",
+    operation_id="unpause_items",
+)
+async def unpause_items(request: Request, ids: str) -> PauseResponse:
+    """Unpause items and their children to resume processing"""
+    ids = handle_ids(ids)
+    try:
+        with db.Session() as session:
+            for media_item in db_functions.get_items_by_ids(ids):
+                try:
+                    if media_item.last_state == States.Paused:
+                        media_item.store_state(None) # recheck the last state
+                        session.merge(media_item)
+                        session.commit()
+                        request.app.program.em.add_event(Event("RetryItem", media_item.id))
+                        logger.info(f"Successfully unpaused {media_item.log_string}")
+                    else:
+                        logger.debug(f"Skipping unpause for {media_item.log_string} - not in paused state")
+                except Exception as e:
+                    logger.error(f"Failed to unpause {media_item.log_string}: {str(e)}")
+                    continue
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    return {"message": f"Successfully unpaused items.", "ids": ids}
